@@ -14,3 +14,5 @@ wandb/
 *.pt
 *.pth
 *.safetensors
+scripts/wandb/
+scripts/wandb/*
