@@ -9,5 +9,6 @@ matplotlib
 librosa
 soundfile
 tensorboardX=2.6.2.2
+wandb
 
 

@@ -4,10 +4,7 @@ from datasets import load_dataset, Audio
 from transformers import SpeechT5Processor
 from collections import defaultdict
 import matplotlib.pyplot as plt
-import wandb  
-import os
-
-
+import wandb  # Add wandb import
 
 """ 
 Preprocess the data 
@@ -417,46 +414,20 @@ class TTSDataCollatorWithPadding:
 
 data_collator = TTSDataCollatorWithPadding(processor=processor)
 
-"""
-Training the model with W&B model registry upload
-"""
 
-import wandb
+"""
+Training Model
+"""
 from transformers import SpeechT5ForTextToSpeech
 from transformers import Seq2SeqTrainingArguments
 from transformers import Seq2SeqTrainer
-from transformers.integrations import WandbCallback
-import os
-from datetime import datetime
 
-# Generate a unique run name with timestamp
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-run_name = f"speecht5_nl_run_{timestamp}"
-output_dir = f"speecht5_finetuned_voxpopuli_nl_{timestamp}"
-
-# Initialize wandb with more metadata
-wandb.init(
-    project="speecht5-tts-finetuning",
-    name=run_name,
-    config={
-        "model_checkpoint": "microsoft/speecht5_tts",
-        "dataset": "facebook/voxpopuli",
-        "language": "nl",
-        "batch_size": 4,
-        "learning_rate": 1e-5,
-        "warmup_steps": 500,
-        "max_steps": 4000,
-        "output_dir": output_dir,
-        "timestamp": timestamp,
-    }
-)
 
 model = SpeechT5ForTextToSpeech.from_pretrained(checkpoint)
 model.config.use_cache = False
 
 training_args = Seq2SeqTrainingArguments(
-    output_dir=output_dir,
-    run_name=run_name,
+    output_dir="speecht5_finetuned_voxpopuli_nl",  # change to a repo name of your choice
     per_device_train_batch_size=4,
     gradient_accumulation_steps=8,
     learning_rate=1e-5,
@@ -469,44 +440,13 @@ training_args = Seq2SeqTrainingArguments(
     save_steps=1000,
     eval_steps=1000,
     logging_steps=25,
-    report_to=["tensorboard", "wandb"],
+    report_to=["tensorboard"],
     load_best_model_at_end=True,
     greater_is_better=False,
     label_names=["labels"],
     push_to_hub=True,
 )
 
-# Create a custom W&B callback to register the model after training
-class ModelRegistryCallback(WandbCallback):
-    def on_train_end(self, args, state, control, model=None, tokenizer=None, **kwargs):
-        super().on_train_end(args, state, control, model, tokenizer, **kwargs)
-        
-        # Create an artifact for the model
-        model_artifact = wandb.Artifact(
-            name=f"speecht5_finetuned_nl_{timestamp}",
-            type="model",
-            description="Fine-tuned SpeechT5 model on VoxPopuli Dutch dataset"
-        )
-        
-        # Add the model directory to the artifact
-        model_artifact.add_dir(args.output_dir)
-        
-        # Add metadata
-        model_artifact.metadata = {
-            "base_model": "microsoft/speecht5_tts",
-            "dataset": "facebook/voxpopuli",
-            "language": "nl",
-            "fine_tuning_steps": args.max_steps,
-            "learning_rate": args.learning_rate,
-            "final_loss": state.log_history[-1].get("eval_loss", "N/A"),
-            "best_model_checkpoint": state.best_model_checkpoint
-        }
-        
-        # Log and register the artifact
-        wandb.log_artifact(model_artifact)
-        print(f"✅ Model artifact '{model_artifact.name}' uploaded to W&B model registry")
-
-# Use the standard trainer with our custom callback
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
@@ -514,24 +454,8 @@ trainer = Seq2SeqTrainer(
     eval_dataset=dataset["test"],
     data_collator=data_collator,
     processing_class=processor,
-    callbacks=[ModelRegistryCallback],  # Add our custom callback
 )
 
-# Train the model
 trainer.train()
-
-# Save the processor
-processor_output_path = os.path.join(output_dir, "processor")
-os.makedirs(processor_output_path, exist_ok=True)
-processor.save_pretrained(processor_output_path)
-
-# Push to Hugging Face Hub
+processor.save_pretrained("michellelychan/speecht5_finetuned_voxpopuli_nl")
 trainer.push_to_hub()
-
-# Log a final message about where to find the model
-print(f"Training complete! Model saved to: {output_dir}")
-print(f"Model uploaded to W&B model registry as: speecht5_finetuned_nl_{timestamp}")
-print(f"To use this model, load it from W&B or from the local directory: {output_dir}")
-
-# Close wandb run when done
-wandb.finish()
