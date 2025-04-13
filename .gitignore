@@ -1,2 +1,16 @@
 =0.20.0
- env/
+env/
+.bash_history
+.bash_logout
+.bashrc
+.netrc
+.profile
+.wget-hsts
+speecht5_finetuned_voxpopuli_nl/
+speecht5_finetuned_voxpopuli_nl/
+speecht5_finetuned_voxpopuli_nl_*/
+*.wav
+wandb/
+*.pt
+*.pth
+*.safetensors
