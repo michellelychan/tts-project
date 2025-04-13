@@ -1,13 +1,18 @@
 from transformers import pipeline
 import scipy
 from datasets import load_dataset, Audio
-from transformers import SpeechT5Processor, SpeechT5HifiGan
+from transformers import SpeechT5Processor
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import wandb  
 import os
 import torch
+from datetime import datetime
 
+# Create necessary directories
+os.makedirs("../models", exist_ok=True)
+os.makedirs("../outputs/images", exist_ok=True)
+os.makedirs("../outputs/audio", exist_ok=True)
 
 """ 
 Preprocess the data 
@@ -34,7 +39,7 @@ wandb.log({"initial_dataset_size": len(dataset)})
 
 # synthesiser = pipeline("text-to-speech", "suno/bark-small")
 # speech = synthesiser("Hello, my dog is cooler than you!", forward_params={"do_sample": True})
-# scipy.io.wavfile.write("bark_out.wav", rate=speech["sampling_rate"], data=speech["audio"])
+# scipy.io.wavfile.write("../outputs/audio/bark_out.wav", rate=speech["sampling_rate"], data=speech["audio"])
 
 dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 
@@ -93,7 +98,7 @@ plt.figure()
 hist = plt.hist(speaker_counts.values(), bins=20)
 plt.ylabel("Speakers")
 plt.xlabel("Examples")
-plt.savefig('speaker_examples_histogram.png')
+plt.savefig('../outputs/images/speaker_examples_histogram.png')
 
 # Log the histogram to wandb
 wandb.log({"speaker_examples_histogram": wandb.Image(plt)})
@@ -164,7 +169,7 @@ print(f"speaker embedding shape: {processed_example['speaker_embeddings'].shape}
 
 plt.figure()
 plt.imshow(processed_example["labels"].T)
-plt.savefig("log-mel_spectrogram_example.png")
+plt.savefig("../outputs/images/log-mel_spectrogram_example.png")
 
 # Log example spectrogram to wandb
 wandb.log({"spectrogram_example": wandb.Image(plt)})
@@ -226,32 +231,32 @@ class TTSDataCollatorWithPadding:
         return batch
 
 """
-Audio Logging Function
+Audio Generation Function
 """
-def log_audio_samples(model, processor, dataset, vocoder, num_samples=3):
+def generate_audio_samples(model, processor, dataset, vocoder, num_samples=3):
     """
-    Generate and log audio samples from the model to Weights & Biases
+    Generate audio samples from the model and save them locally
     
     Args:
         model: The SpeechT5ForTextToSpeech model
         processor: The SpeechT5Processor
         dataset: The dataset dictionary containing 'test' split
         vocoder: SpeechT5HifiGan vocoder for converting spectrograms to audio
-        num_samples: Number of samples to generate and log
+        num_samples: Number of samples to generate
     """
-    print("Generating audio samples for logging...")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    print("Generating audio samples...")
     
     # Get texts from test set for visualization
     examples = [dataset["test"][i] for i in range(min(num_samples, len(dataset["test"])))]
     
-    # Move vocoder to the same device as the model
+    # Move vocoder to the same device as model
     device = model.device
     vocoder = vocoder.to(device)
     
     # Store original texts for captions
     original_texts = []
     for i, example_idx in enumerate(range(min(num_samples, len(dataset["test"])))):
-        # Get original text if available in the dataset metadata
         try:
             original_text = dataset["test"].features["normalized_text"][example_idx]
             original_texts.append(original_text)
@@ -271,29 +276,31 @@ def log_audio_samples(model, processor, dataset, vocoder, num_samples=3):
                 vocoder=vocoder
             )
         
-        # Convert to numpy for wandb
+        # Convert to numpy for saving
         audio_array = speech.cpu().numpy()
         
-        # Create a caption - use original text if available
-        caption = original_texts[i] if i < len(original_texts) else f"Generated speech sample {i+1}"
+        # Save audio locally
+        audio_path = f"../outputs/audio/sample_{i+1}_{timestamp}.wav"
+        scipy.io.wavfile.write(audio_path, rate=16000, data=audio_array)
         
-        # Log to wandb
+        # Log to wandb if available
+        caption = original_texts[i] if i < len(original_texts) else f"Generated speech sample {i+1}"
         wandb.log({
             f"audio_sample_{i+1}": wandb.Audio(
                 audio_array, 
-                sample_rate=16000,  # SpeechT5 uses 16kHz
+                sample_rate=16000,
                 caption=caption
             )
         })
         
-        print(f"Logged audio sample {i+1}")
+        print(f"Saved audio sample {i+1} to {audio_path}")
 
 """
 Training the model with W&B model registry upload
 """
 
 import wandb
-from transformers import SpeechT5ForTextToSpeech
+from transformers import SpeechT5ForTextToSpeech, SpeechT5HifiGan
 from transformers import Seq2SeqTrainingArguments
 from transformers import Seq2SeqTrainer
 from transformers.integrations import WandbCallback
@@ -303,7 +310,7 @@ from datetime import datetime
 # Generate a unique run name with timestamp
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"speecht5_nl_run_{timestamp}"
-output_dir = f"speecht5_finetuned_voxpopuli_nl_{timestamp}"
+output_dir = f"../models/speecht5_finetuned_voxpopuli_nl_{timestamp}"
 
 # Initialize wandb with more metadata
 wandb.init(
@@ -352,7 +359,7 @@ training_args = Seq2SeqTrainingArguments(
     push_to_hub=True,
 )
 
-# Create a custom W&B callback to register the model and log audio samples
+# Create a custom W&B callback to register the model and generate audio samples
 class ModelRegistryAndAudioCallback(WandbCallback):
     def __init__(self, model, processor, dataset, vocoder):
         super().__init__()
@@ -360,37 +367,37 @@ class ModelRegistryAndAudioCallback(WandbCallback):
         self.processor = processor
         self.dataset = dataset
         self.vocoder = vocoder
-        
+    
     def on_evaluate(self, args, state, control, **kwargs):
-        # Call the parent method correctly with only the expected arguments
+        # Call the parent method
         super().on_evaluate(args, state, control)
         
         # Get the model from kwargs or use self.model
         model = kwargs.get('model', self.model)
         
-        # Only log audio samples every 1000 steps to avoid too many samples
+        # Only generate audio samples every 1000 steps
         if state.global_step % 1000 == 0:
-            log_audio_samples(
+            generate_audio_samples(
                 model=model,
                 processor=self.processor,
                 dataset=self.dataset,
                 vocoder=self.vocoder,
-                num_samples=3
+                num_samples=2
             )
-            
+        
     def on_train_end(self, args, state, control, **kwargs):
         super().on_train_end(args, state, control)
         
         # Get the model from kwargs or use self.model
         model = kwargs.get('model', self.model)
         
-        # Log final audio samples
-        log_audio_samples(
+        # Generate final audio samples
+        generate_audio_samples(
             model=model,
             processor=self.processor,
             dataset=self.dataset,
             vocoder=self.vocoder,
-            num_samples=5  # Log more samples at the end
+            num_samples=5  # More samples at the end
         )
         
         # Create an artifact for the model
@@ -417,7 +424,7 @@ class ModelRegistryAndAudioCallback(WandbCallback):
         # Log and register the artifact
         wandb.log_artifact(model_artifact)
         print(f"✅ Model artifact '{model_artifact.name}' uploaded to W&B model registry")
-        
+
 # Use the standard trainer with our custom callback
 trainer = Seq2SeqTrainer(
     args=training_args,
@@ -429,7 +436,7 @@ trainer = Seq2SeqTrainer(
 )
 
 # Generate initial audio samples before training
-log_audio_samples(model, processor, dataset, vocoder, num_samples=2)
+generate_audio_samples(model, processor, dataset, vocoder, num_samples=2)
 
 # Train the model
 trainer.train()
