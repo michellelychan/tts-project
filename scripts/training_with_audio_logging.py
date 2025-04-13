@@ -93,6 +93,7 @@ plt.figure()
 hist = plt.hist(speaker_counts.values(), bins=20)
 plt.ylabel("Speakers")
 plt.xlabel("Examples")
+os.makedirs('../outputs/images/', exist_ok=True)
 plt.savefig('../outputs/images/speaker_examples_histogram.png')
 
 # Log the histogram to wandb
