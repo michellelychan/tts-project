@@ -1,40 +1,66 @@
 from transformers import pipeline
 import scipy
 from datasets import load_dataset, Audio
-from transformers import SpeechT5Processor, SpeechT5HifiGan
+from transformers import SpeechT5Processor
 from collections import defaultdict
 import matplotlib.pyplot as plt
-import wandb  
+import mlflow
 import os
 import torch
+from datetime import datetime
 
+# Create necessary directories
+os.makedirs("../models", exist_ok=True)
+os.makedirs("../outputs/images", exist_ok=True)
+os.makedirs("../outputs/audio", exist_ok=True)
 
 """ 
 Preprocess the data 
 """ 
 
-# Initialize wandb
-wandb.init(
-    project="speecht5-tts-finetuning",  
-    config={
-        "model_checkpoint": "microsoft/speecht5_tts",
-        "dataset": "facebook/voxpopuli",
-        "language": "nl",
-        "batch_size": 4,
-        "learning_rate": 1e-5,
-        "warmup_steps": 500,
-        "max_steps": 4000,
-    }
-)
+# Initialize MLflow at the beginning
+# Set tracking URI to local MLflow server (running on same machine)
+mlflow.set_tracking_uri("http://localhost:5000")  # Update this if your server has a different port
+
+# Configure MLflow to batch logged metrics
+# This greatly improves performance by reducing network calls
+os.environ['MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING'] = 'false'  # Disable system metrics
+os.environ['MLFLOW_BATCH_LOGGING_MIN_FLUSH_INTERVAL_SECONDS'] = '20'  # Only flush every 20 seconds
+
+experiment_name = "speecht5-tts-finetuning"
+
+# Create or get the experiment
+experiment = mlflow.get_experiment_by_name(experiment_name)
+if experiment is None:
+    experiment_id = mlflow.create_experiment(experiment_name)
+else:
+    experiment_id = experiment.experiment_id
+
+# Start a new MLflow run with a descriptive name
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_name = f"speecht5_nl_run_{timestamp}"
+run = mlflow.start_run(experiment_id=experiment_id, run_name=run_name)
+
+# Log all parameters at once to reduce API calls
+mlflow.log_params({
+    "model_checkpoint": "microsoft/speecht5_tts",
+    "dataset": "facebook/voxpopuli",
+    "language": "nl",
+    "batch_size": 4,
+    "learning_rate": 1e-5,
+    "warmup_steps": 500,
+    "max_steps": 4000,
+    "training_timestamp": timestamp,
+})
 
 dataset = load_dataset("facebook/voxpopuli", "nl", split="train")
 print(len(dataset))
 # Log the initial dataset size
-wandb.log({"initial_dataset_size": len(dataset)})
+mlflow.log_metric("initial_dataset_size", len(dataset))
 
 # synthesiser = pipeline("text-to-speech", "suno/bark-small")
 # speech = synthesiser("Hello, my dog is cooler than you!", forward_params={"do_sample": True})
-# scipy.io.wavfile.write("bark_out.wav", rate=speech["sampling_rate"], data=speech["audio"])
+# scipy.io.wavfile.write("../outputs/audio/bark_out.wav", rate=speech["sampling_rate"], data=speech["audio"])
 
 dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 
@@ -60,11 +86,12 @@ tokenizer_vocab = {k for k, _ in tokenizer.get_vocab().items()}
 unsupported_chars = dataset_vocab - tokenizer_vocab
 print(f"dataset_vocab - tokenizer_vocab {unsupported_chars}")
 
-# Log unsupported characters as a Table
-wandb_unsupported_table = wandb.Table(columns=["character"])
-for char in unsupported_chars:
-    wandb_unsupported_table.add_data(char)
-wandb.log({"unsupported_characters": wandb_unsupported_table})
+# Log unsupported characters as a text file
+# But defer actual logging to reduce overhead during startup
+with open("../outputs/unsupported_chars.txt", "w") as f:
+    for char in unsupported_chars:
+        f.write(f"{char}\n")
+# We'll log this artifact later with other artifacts in batches
 
 replacements = [
     ("à", "a"),
@@ -93,11 +120,9 @@ plt.figure()
 hist = plt.hist(speaker_counts.values(), bins=20)
 plt.ylabel("Speakers")
 plt.xlabel("Examples")
-os.makedirs('../outputs/images/', exist_ok=True)
 plt.savefig('../outputs/images/speaker_examples_histogram.png')
 
-# Log the histogram to wandb
-wandb.log({"speaker_examples_histogram": wandb.Image(plt)})
+# We'll log this histogram later with other artifacts in batches
 
 def select_speaker(speaker_id):
     return 100 <= speaker_counts[speaker_id] <= 400
@@ -110,7 +135,7 @@ print(f"no. of speakers: {num_speakers}")
 print(f"length of dataset: {len_dataset}")
 
 # Log dataset statistics after filtering
-wandb.log({
+mlflow.log_metrics({
     "num_speakers": num_speakers,
     "filtered_dataset_size": len_dataset
 })
@@ -167,8 +192,7 @@ plt.figure()
 plt.imshow(processed_example["labels"].T)
 plt.savefig("../outputs/images/log-mel_spectrogram_example.png")
 
-# Log example spectrogram to wandb
-wandb.log({"spectrogram_example": wandb.Image(plt)})
+# We'll log this spectrogram later with other artifacts in batches
 
 dataset = dataset.map(prepare_dataset, remove_columns=dataset.column_names)
 
@@ -180,10 +204,10 @@ dataset = dataset.filter(is_not_too_long, input_columns=["input_ids"])
 print(f"length of filtered dataset: {len(dataset)}")
 
 # Log dataset size after length filtering
-wandb.log({"length_filtered_dataset_size": len(dataset)})
+mlflow.log_metric("length_filtered_dataset_size", len(dataset))
 
 dataset = dataset.train_test_split(test_size=0.1)
-wandb.log({
+mlflow.log_metrics({
     "train_set_size": len(dataset["train"]),
     "test_set_size": len(dataset["test"])
 })
@@ -227,37 +251,44 @@ class TTSDataCollatorWithPadding:
         return batch
 
 """
-Audio Logging Function
+Audio Generation Function
 """
-def log_audio_samples(model, processor, dataset, vocoder, num_samples=3):
+def generate_audio_samples(model, processor, dataset, vocoder, num_samples=3):
     """
-    Generate and log audio samples from the model to Weights & Biases
+    Generate audio samples from the model and save them locally
     
     Args:
         model: The SpeechT5ForTextToSpeech model
         processor: The SpeechT5Processor
         dataset: The dataset dictionary containing 'test' split
         vocoder: SpeechT5HifiGan vocoder for converting spectrograms to audio
-        num_samples: Number of samples to generate and log
+        num_samples: Number of samples to generate
     """
-    print("Generating audio samples for logging...")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    print("Generating audio samples...")
     
     # Get texts from test set for visualization
     examples = [dataset["test"][i] for i in range(min(num_samples, len(dataset["test"])))]
     
-    # Move vocoder to the same device as the model
+    # Move vocoder to the same device as model
     device = model.device
     vocoder = vocoder.to(device)
     
     # Store original texts for captions
     original_texts = []
     for i, example_idx in enumerate(range(min(num_samples, len(dataset["test"])))):
-        # Get original text if available in the dataset metadata
         try:
             original_text = dataset["test"].features["normalized_text"][example_idx]
             original_texts.append(original_text)
         except:
             original_texts.append(f"Sample {i+1}")
+    
+    audio_files = []
+    artifact_paths = []
+    
+    # Create a temporary directory for batching artifacts
+    tmp_dir = f"../outputs/audio/tmp_{timestamp}"
+    os.makedirs(tmp_dir, exist_ok=True)
     
     for i, example in enumerate(examples):
         # Setup inputs
@@ -272,56 +303,55 @@ def log_audio_samples(model, processor, dataset, vocoder, num_samples=3):
                 vocoder=vocoder
             )
         
-        # Convert to numpy for wandb
+        # Convert to numpy for saving
         audio_array = speech.cpu().numpy()
         
-        # Create a caption - use original text if available
+        # Save audio locally
+        audio_path = f"{tmp_dir}/sample_{i+1}.wav"
+        scipy.io.wavfile.write(audio_path, rate=16000, data=audio_array)
+        audio_files.append(audio_path)
+        artifact_paths.append(audio_path)
+        
+        # Add caption info in a text file
+        caption_path = f"{tmp_dir}/sample_{i+1}_caption.txt"
         caption = original_texts[i] if i < len(original_texts) else f"Generated speech sample {i+1}"
+        with open(caption_path, "w") as f:
+            f.write(caption)
+        artifact_paths.append(caption_path)
         
-        # Log to wandb
-        wandb.log({
-            f"audio_sample_{i+1}": wandb.Audio(
-                audio_array, 
-                sample_rate=16000,  # SpeechT5 uses 16kHz
-                caption=caption
-            )
-        })
-        
-        print(f"Logged audio sample {i+1}")
+        print(f"Generated audio sample {i+1}")
+    
+    # Log all artifacts at once to reduce overhead
+    mlflow.log_artifacts(tmp_dir, artifact_path=f"audio_samples_{timestamp}")
+    print(f"Logged {len(audio_files)} audio samples to MLflow")
+    
+    return audio_files
 
 """
-Training the model with W&B model registry upload
+Training the model with MLflow model registry
 """
 
-import wandb
-from transformers import SpeechT5ForTextToSpeech
+from transformers import SpeechT5ForTextToSpeech, SpeechT5HifiGan
 from transformers import Seq2SeqTrainingArguments
 from transformers import Seq2SeqTrainer
-from transformers.integrations import WandbCallback
 import os
+import time
 from datetime import datetime
+
+# Now batch log all the artifacts we've generated so far
+artifact_dir = "../outputs"
+print("Logging initial artifacts to MLflow...")
+mlflow.log_artifacts(artifact_dir, artifact_path="preprocessing_artifacts")
 
 # Generate a unique run name with timestamp
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"speecht5_nl_run_{timestamp}"
 output_dir = f"../models/speecht5_finetuned_voxpopuli_nl_{timestamp}"
 
-# Initialize wandb with more metadata
-wandb.init(
-    project="speecht5-tts-finetuning",
-    name=run_name,
-    config={
-        "model_checkpoint": "microsoft/speecht5_tts",
-        "dataset": "facebook/voxpopuli",
-        "language": "nl",
-        "batch_size": 4,
-        "learning_rate": 1e-5,
-        "warmup_steps": 500,
-        "max_steps": 4000,
-        "output_dir": output_dir,
-        "timestamp": timestamp,
-    }
-)
+# Log more metadata
+mlflow.set_tag("run_name", run_name)
+mlflow.set_tag("output_dir", output_dir)
+mlflow.set_tag("timestamp", timestamp)
 
 model = SpeechT5ForTextToSpeech.from_pretrained(checkpoint)
 model.config.use_cache = False
@@ -343,82 +373,120 @@ training_args = Seq2SeqTrainingArguments(
     fp16=True,
     eval_strategy="steps",
     per_device_eval_batch_size=2,
-    save_steps=1000,
-    eval_steps=1000,
-    logging_steps=25,
-    report_to=["tensorboard", "wandb"],
+    # Increase steps between evaluations to reduce overhead
+    save_steps=2000,  # Save less frequently 
+    eval_steps=1000,  
+    # Log less frequently for better performance
+    logging_steps=100,  # Log every 100 steps instead of 25
+    report_to=["tensorboard"],  # Removed wandb, kept tensorboard
     load_best_model_at_end=True,
     greater_is_better=False,
     label_names=["labels"],
     push_to_hub=True,
 )
 
-# Create a custom W&B callback to register the model and log audio samples
-class ModelRegistryAndAudioCallback(WandbCallback):
+# Custom callback for MLflow logging and audio sample generation
+from transformers.integrations import TensorBoardCallback
+from transformers.trainer_callback import TrainerCallback
+
+class MLflowAndAudioCallback(TrainerCallback):
     def __init__(self, model, processor, dataset, vocoder):
-        super().__init__()
         self.model = model
         self.processor = processor
         self.dataset = dataset
         self.vocoder = vocoder
+        self.metrics_buffer = {}
+        self.last_log_time = time.time()
         
-    def on_evaluate(self, args, state, control, **kwargs):
-        # Call the parent method correctly with only the expected arguments
-        super().on_evaluate(args, state, control)
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        # Log metrics to MLflow - but batch them for efficiency
+        if metrics:
+            step = state.global_step
+            metrics_to_log = {}
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    metrics_to_log[key] = value
+            
+            # Log all metrics at once rather than individually
+            if metrics_to_log:
+                mlflow.log_metrics(metrics_to_log, step=step)
         
-        # Get the model from kwargs or use self.model
-        model = kwargs.get('model', self.model)
-        
-        # Only log audio samples every 1000 steps to avoid too many samples
-        if state.global_step % 1000 == 0:
-            log_audio_samples(
+        # Only generate audio samples at specific intervals
+        # First time, then every 2000 steps to avoid slowing down training
+        if state.global_step == 0 or (state.global_step % 2000 == 0 and state.global_step > 0):
+            model = kwargs.get('model', self.model)
+            
+            # Generate fewer samples during training to reduce overhead
+            num_samples = 1 if state.global_step < args.max_steps // 2 else 2
+            
+            generate_audio_samples(
                 model=model,
                 processor=self.processor,
                 dataset=self.dataset,
                 vocoder=self.vocoder,
-                num_samples=3
+                num_samples=num_samples
             )
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # Log metrics to MLflow - but only every 25 steps to reduce overhead
+        if logs and state.global_step % 25 == 0:
+            step = state.global_step
+            metrics_to_log = {}
+            for key, value in logs.items():
+                if isinstance(value, (int, float)):
+                    metrics_to_log[key] = value
             
+            # Log all metrics at once rather than individually
+            if metrics_to_log:
+                mlflow.log_metrics(metrics_to_log, step=step)
+    
     def on_train_end(self, args, state, control, **kwargs):
-        super().on_train_end(args, state, control)
-        
-        # Get the model from kwargs or use self.model
         model = kwargs.get('model', self.model)
         
-        # Log final audio samples
-        log_audio_samples(
+        print("Training complete! Generating final audio samples...")
+        # Generate final audio samples
+        audio_files = generate_audio_samples(
             model=model,
             processor=self.processor,
             dataset=self.dataset,
             vocoder=self.vocoder,
-            num_samples=5  # Log more samples at the end
+            num_samples=3  # Fewer samples to reduce overhead
         )
         
-        # Create an artifact for the model
-        model_artifact = wandb.Artifact(
-            name=f"speecht5_finetuned_nl_{timestamp}",
-            type="model",
-            description="Fine-tuned SpeechT5 model on VoxPopuli Dutch dataset"
+        print("Registering model in MLflow model registry...")
+        # Log the final model to MLflow model registry - but optimize for performance
+        # First, save model and processor locally
+        model_path = os.path.join(output_dir, "final_model")
+        model.save_pretrained(model_path)
+        
+        processor_path = os.path.join(output_dir, "processor")
+        processor.save_pretrained(processor_path)
+        
+        # Log metadata about the run first
+        mlflow.set_tag("final_eval_loss", state.log_history[-1].get("eval_loss", "N/A"))
+        mlflow.set_tag("best_model_checkpoint", state.best_model_checkpoint)
+        
+        # Then log model to MLflow model registry
+        print("Uploading model to MLflow registry (this may take a while)...")
+        mlflow.transformers.log_model(
+            transformers_model={
+                "model": model,
+                "processor": processor
+            },
+            artifact_path="model",
+            registered_model_name=f"speecht5_finetuned_nl_{timestamp}"
         )
         
-        # Add the model directory to the artifact
-        model_artifact.add_dir(args.output_dir)
+        # Log only essential artifacts to reduce upload time
+        # Instead of uploading all checkpoints, just log the final and best models
+        print("Logging final model artifacts...")
+        mlflow.log_artifact(model_path, artifact_path="final_model")
+        best_checkpoint = state.best_model_checkpoint
+        if best_checkpoint and os.path.exists(best_checkpoint):
+            mlflow.log_artifact(best_checkpoint, artifact_path="best_model_checkpoint")
         
-        # Add metadata
-        model_artifact.metadata = {
-            "base_model": "microsoft/speecht5_tts",
-            "dataset": "facebook/voxpopuli",
-            "language": "nl",
-            "fine_tuning_steps": args.max_steps,
-            "learning_rate": args.learning_rate,
-            "final_loss": state.log_history[-1].get("eval_loss", "N/A"),
-            "best_model_checkpoint": state.best_model_checkpoint
-        }
-        
-        # Log and register the artifact
-        wandb.log_artifact(model_artifact)
-        print(f"✅ Model artifact '{model_artifact.name}' uploaded to W&B model registry")
-        
+        print(f"✅ Model registered in MLflow model registry as: speecht5_finetuned_nl_{timestamp}")
+
 # Use the standard trainer with our custom callback
 trainer = Seq2SeqTrainer(
     args=training_args,
@@ -426,11 +494,15 @@ trainer = Seq2SeqTrainer(
     train_dataset=dataset["train"],
     eval_dataset=dataset["test"],
     data_collator=data_collator,
-    callbacks=[ModelRegistryAndAudioCallback(model, processor, dataset, vocoder)],  # Add our custom callback
+    callbacks=[
+        TensorBoardCallback(),  # Standard TensorBoard logging
+        MLflowAndAudioCallback(model, processor, dataset, vocoder)  # Our custom MLflow callback
+    ],
 )
 
-# Generate initial audio samples before training
-log_audio_samples(model, processor, dataset, vocoder, num_samples=2)
+# Generate initial audio samples before training - but only one to save time
+print("Generating initial audio sample...")
+initial_samples = generate_audio_samples(model, processor, dataset, vocoder, num_samples=1)
 
 # Train the model
 trainer.train()
@@ -441,12 +513,13 @@ os.makedirs(processor_output_path, exist_ok=True)
 processor.save_pretrained(processor_output_path)
 
 # Push to Hugging Face Hub
-trainer.push_to_hub()
+if training_args.push_to_hub:
+    trainer.push_to_hub()
 
 # Log a final message about where to find the model
 print(f"Training complete! Model saved to: {output_dir}")
-print(f"Model uploaded to W&B model registry as: speecht5_finetuned_nl_{timestamp}")
-print(f"To use this model, load it from W&B or from the local directory: {output_dir}")
+print(f"Model registered in MLflow model registry as: speecht5_finetuned_nl_{timestamp}")
+print(f"To use this model, load it from MLflow model registry or from the local directory: {output_dir}")
 
-# Close wandb run when done
-wandb.finish()
+# End the MLflow run
+mlflow.end_run()

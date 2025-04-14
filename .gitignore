@@ -16,3 +16,7 @@ wandb/
 *.safetensors
 scripts/wandb/
 scripts/wandb/*
+mlartifacts/
+mlartifacts/*
+mlruns/
+mlruns/*

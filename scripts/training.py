@@ -18,9 +18,9 @@ os.makedirs("../outputs/audio", exist_ok=True)
 Preprocess the data 
 """ 
 
-# Initialize wandb at the beginning of your script
+# Initialize wandb at the beginning
 wandb.init(
-    project="speecht5-tts-finetuning",  # name this whatever you want
+    project="speecht5-tts-finetuning",  
     config={
         "model_checkpoint": "microsoft/speecht5_tts",
         "dataset": "facebook/voxpopuli",
