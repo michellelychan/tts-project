@@ -11,6 +11,11 @@ soundfile
 tensorboardX==2.6.2.2
 wandb
 mlflow
+speechbrain
+datasets
+torch
+accelerate
 datasets
 sentencepiece
 speechbrain
+
